@@ -10,7 +10,12 @@ New-Item -ItemType Directory -Force -Path $out | Out-Null
     /out:"$out\CodexProcessGuard.exe" "$root\Program.cs"
 if ($LASTEXITCODE -ne 0) { throw 'Compilation failed.' }
 
-$test = Start-Process -FilePath "$out\CodexProcessGuard.exe" -ArgumentList '--self-test' -Wait -PassThru
+try {
+    $test = Start-Process -FilePath "$out\CodexProcessGuard.exe" -ArgumentList '--self-test' -Wait -PassThru -ErrorAction Stop
+}
+catch {
+    throw "Built successfully, but Windows refused to start the safety self-test. If Smart App Control is on, use a trusted code-signing certificate; do not disable system protection. $($_.Exception.Message)"
+}
 if ($test.ExitCode -ne 0) { throw 'Safety self-tests failed.' }
 
 Write-Host "Built and tested: $out\CodexProcessGuard.exe"
