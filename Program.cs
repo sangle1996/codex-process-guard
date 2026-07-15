@@ -60,12 +60,13 @@ namespace CodexProcessGuard
             cleaner = new ProcessCleaner(settingsStore.DataDirectory);
             form = new GuardForm(settingsStore.Settings);
             form.SaveRequested += SaveSettings;
-            form.CleanRequested += delegate { RunScan(true); };
+            form.ScanRequested += delegate { RunScan(true); };
+            form.KillRequested += RunManualKill;
             form.HideRequested += delegate { form.Hide(); };
 
             var menu = new ContextMenuStrip();
             menu.Items.Add("Open settings", null, delegate { ShowForm(); });
-            menu.Items.Add("Clean now", null, delegate { RunScan(true); });
+            menu.Items.Add("Scan now", null, delegate { RunScan(true); });
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("Exit", null, delegate { ExitGuard(); });
 
@@ -82,7 +83,7 @@ namespace CodexProcessGuard
             settingsStore.ApplyStartup();
 
             form.SetLog(settingsStore.ReadRecentLog());
-            Log("Guard started in safe mode. Active Codex process trees will never be killed.");
+            Log("Guard started. Automatic cleanup preserves every active Codex process tree; manual older-cohort removal requires confirmation.");
             RunScan(false);
             if (!background) ShowForm();
         }
@@ -126,14 +127,14 @@ namespace CodexProcessGuard
             }
 
             form.SetScanning();
-            Task.Factory.StartNew(() => cleaner.Scan())
+            Task.Factory.StartNew(() => cleaner.Scan(), CancellationToken.None, TaskCreationOptions.None, TaskScheduler.Default)
                 .ContinueWith(task =>
                 {
                     bool runQueued = scanGate.ExitAndTakeQueued();
                     if (task.IsFaulted)
                     {
-                        Log("Scan failed safely; nothing was killed.");
-                        form.SetError();
+                        Log("Scan failed; any completed termination passed exact identity checks. State will be reconciled on the next scan.");
+                        form.SetError("Status: scan failed; see the safe-scan log for details.");
                     }
                     else
                     {
@@ -159,6 +160,39 @@ namespace CodexProcessGuard
                         }
                     }
                     if (runQueued) RunScan(true);
+                }, TaskScheduler.FromCurrentSynchronizationContext());
+        }
+
+        private void RunManualKill(CohortInfo selected)
+        {
+            if (!scanGate.TryEnter(false))
+            {
+                Log("A scan is running. Manual removal was not queued; select the cohort and try again.");
+                return;
+            }
+
+            form.SetKilling();
+            Task.Factory.StartNew(() => cleaner.KillOlderCohort(selected), CancellationToken.None, TaskCreationOptions.None, TaskScheduler.Default)
+                .ContinueWith(task =>
+                {
+                    scanGate.ExitAndTakeQueued();
+                    if (task.IsFaulted)
+                    {
+                        Log("Manual removal encountered an error; any completed termination passed exact identity checks. Refreshing state now.");
+                        form.SetError("Status: manual removal may have partially completed; refreshing state.");
+                    }
+                    else
+                    {
+                        var result = task.Result;
+                        Log(result.Message);
+                        if (result.Killed > 0)
+                        {
+                            tray.BalloonTipTitle = "Codex Process Guard";
+                            tray.BalloonTipText = string.Format("Manually removed {0}/{1} process(es) from the selected older cohort.", result.Killed, result.Requested);
+                            tray.ShowBalloonTip(5000);
+                        }
+                    }
+                    RunScan(false);
                 }, TaskScheduler.FromCurrentSynchronizationContext());
         }
 
@@ -219,10 +253,12 @@ namespace CodexProcessGuard
         private readonly Label nextScan;
         private readonly DataGridView cohorts;
         private readonly TextBox log;
+        private readonly Button killSelected;
         private bool allowClose;
 
         public event Action<int, bool> SaveRequested;
-        public event Action CleanRequested;
+        public event Action ScanRequested;
+        public event Action<CohortInfo> KillRequested;
         public event Action HideRequested;
 
         public GuardForm(GuardSettings settings)
@@ -237,7 +273,7 @@ namespace CodexProcessGuard
             var title = new Label { Text = "Codex Process Guard", Font = new Font(Font, FontStyle.Bold), AutoSize = true, Left = 18, Top = 16 };
             var safety = new Label
             {
-                Text = "Safe mode: never kills a helper while its exact Codex owner is running. After Codex exits, the same orphan must be confirmed in two scans before removal.",
+                Text = "Automatic cleanup never kills a helper while its exact Codex owner is running. Manual removal is available only for a selected older live cohort and is revalidated immediately before termination.",
                 Left = 18, Top = 45, Width = 1090, Height = 42
             };
 
@@ -247,15 +283,17 @@ namespace CodexProcessGuard
             startup = new CheckBox { Text = "Start with Windows", Checked = settings.StartWithWindows, Left = 270, Top = 94, AutoSize = true };
 
             var save = new Button { Text = "Save", Left = 18, Top = 130, Width = 90 };
-            var clean = new Button { Text = "Clean now", Left = 116, Top = 130, Width = 105 };
-            var hide = new Button { Text = "Hide to tray", Left = 229, Top = 130, Width = 110 };
+            var scan = new Button { Text = "Scan now", Left = 116, Top = 130, Width = 105 };
+            killSelected = new Button { Text = "Kill selected older", Left = 229, Top = 130, Width = 150, Enabled = false };
+            var hide = new Button { Text = "Hide to tray", Left = 387, Top = 130, Width = 110 };
             save.Click += delegate { if (SaveRequested != null) SaveRequested((int)interval.Value, startup.Checked); };
-            clean.Click += delegate { if (CleanRequested != null) CleanRequested(); };
+            scan.Click += delegate { if (ScanRequested != null) ScanRequested(); };
+            killSelected.Click += delegate { RequestKillSelected(); };
             hide.Click += delegate { if (HideRequested != null) HideRequested(); };
 
             status = new Label { Text = "Status: starting...", Left = 18, Top = 178, Width = 1090, AutoEllipsis = true };
             nextScan = new Label { Text = "Next scan: —", Left = 18, Top = 202, Width = 565 };
-            var cohortLabel = new Label { Text = "Managed process cohorts (read-only; live cohorts are preserved)", Left = 18, Top = 230, AutoSize = true };
+            var cohortLabel = new Label { Text = "Managed process cohorts (automatic cleanup preserves live cohorts)", Left = 18, Top = 230, AutoSize = true };
             cohorts = new DataGridView
             {
                 Left = 18, Top = 252, Width = 1090, Height = 245, ReadOnly = true,
@@ -265,6 +303,7 @@ namespace CodexProcessGuard
                 Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right,
                 BackgroundColor = SystemColors.Window
             };
+            cohorts.SelectionChanged += delegate { UpdateKillButton(); };
             AddColumn("Started", "Started", 76);
             AddColumn("Age", "Age", 66);
             AddColumn("Owner", "Owner PID", 68);
@@ -281,7 +320,7 @@ namespace CodexProcessGuard
                 ScrollBars = ScrollBars.Vertical, Font = new Font("Consolas", 9), Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right
             };
 
-            Controls.AddRange(new Control[] { title, safety, intervalLabel, interval, minutes, startup, save, clean, hide, status, nextScan, cohortLabel, cohorts, logLabel, log });
+            Controls.AddRange(new Control[] { title, safety, intervalLabel, interval, minutes, startup, save, scan, killSelected, hide, status, nextScan, cohortLabel, cohorts, logLabel, log });
             FormClosing += OnFormClosing;
         }
 
@@ -294,8 +333,9 @@ namespace CodexProcessGuard
             });
         }
 
-        public void SetScanning() { status.Text = "Status: scanning safely..."; }
-        public void SetError() { status.Text = "Status: scan failed safely; no process was killed."; }
+        public void SetScanning() { killSelected.Enabled = false; status.Text = "Status: scanning safely..."; }
+        public void SetKilling() { killSelected.Enabled = false; status.Text = "Status: revalidating selected older cohort..."; }
+        public void SetError(string message) { status.Text = message; }
         public void SetNextScan(DateTime value) { nextScan.Text = "Next scan: " + value.ToString("yyyy-MM-dd HH:mm:ss"); }
         public void SetResult(CleanupResult result, DateTime next)
         {
@@ -307,10 +347,30 @@ namespace CodexProcessGuard
             {
                 int rowIndex = cohorts.Rows.Add(item.StartedLocal.ToString("HH:mm:ss"), FormatAge(item.StartedLocal), item.OwnerPid,
                     item.ProcessCount, item.RamMegabytes.ToString("N0"), item.SocketProcesses, item.ProcessTypes, item.Services, item.Decision);
+                cohorts.Rows[rowIndex].Tag = item;
                 if (item.Decision.StartsWith("Older", StringComparison.Ordinal)) cohorts.Rows[rowIndex].DefaultCellStyle.ForeColor = Color.DarkOrange;
                 if (item.Decision.StartsWith("Owner gone", StringComparison.Ordinal)) cohorts.Rows[rowIndex].DefaultCellStyle.ForeColor = Color.DarkRed;
             }
+            cohorts.ClearSelection();
+            UpdateKillButton();
             SetNextScan(next);
+        }
+
+        private void UpdateKillButton()
+        {
+            var selected = cohorts.SelectedRows.Count == 1 ? cohorts.SelectedRows[0].Tag as CohortInfo : null;
+            killSelected.Enabled = CohortBuilder.IsOlderLive(selected);
+        }
+
+        private void RequestKillSelected()
+        {
+            var selected = cohorts.SelectedRows.Count == 1 ? cohorts.SelectedRows[0].Tag as CohortInfo : null;
+            if (!CohortBuilder.IsOlderLive(selected)) return;
+            string warning = string.Format(
+                "Remove the selected older cohort now?\n\nOwner PID: {0}\nProcesses: {1}\nRAM: {2:N0} MB\nServices: {3}\n\nThis is a manual override and can stop another Codex task. The guard will refuse if the cohort or owner changed since this row was shown.",
+                selected.OwnerPid, selected.ProcessCount, selected.RamMegabytes, selected.Services);
+            if (MessageBox.Show(warning, "Confirm manual cohort removal", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) == DialogResult.Yes && KillRequested != null)
+                KillRequested(selected);
         }
 
         private static string FormatAge(DateTime started)
@@ -352,23 +412,7 @@ namespace CodexProcessGuard
         public CleanupResult Scan()
         {
             var snapshot = ProcessSnapshot.Read();
-            var liveCodex = snapshot.Values.Where(p => p.Name == "codex.exe").ToDictionary(p => p.Identity, p => p);
-
-            // Forget exited/reused helper PIDs before considering any cleanup.
-            foreach (var key in tracked.Keys.ToList())
-            {
-                ProcessInfo current;
-                if (!snapshot.TryGetValue(key.Pid, out current) || !current.Identity.Equals(key)) tracked.Remove(key);
-            }
-
-            // Adopt only helpers whose complete ancestry reaches a currently live Codex identity.
-            foreach (var process in snapshot.Values)
-            {
-                if (!Classifier.IsManagedHelper(process)) continue;
-                ProcessInfo owner = Lineage.FindCodexOwner(process, snapshot);
-                if (owner == null) continue;
-                tracked[process.Identity] = new TrackedProcess(process.Identity, owner.Identity, 0, process.Name);
-            }
+            var liveCodex = RefreshTrackedAndGetLiveCodex(snapshot);
 
             int killed = 0;
             int pending = 0;
@@ -418,6 +462,80 @@ namespace CodexProcessGuard
             SaveState(statePath, tracked);
             var cohorts = CohortBuilder.Build(tracked, snapshot, liveCodex, NetworkSnapshot.ReadOwningPids());
             return new CleanupResult(SystemMemory.GetLoadPercent(), liveCodex.Count, tracked.Count, liveAttached, pending, killed, cohorts);
+        }
+
+        public ManualKillResult KillOlderCohort(CohortInfo selected)
+        {
+            var snapshot = ProcessSnapshot.Read();
+            var liveCodex = RefreshTrackedAndGetLiveCodex(snapshot);
+            var currentCohort = CohortBuilder.FindExactOlder(
+                CohortBuilder.Build(tracked, snapshot, liveCodex, new HashSet<int>()), selected);
+            if (currentCohort == null)
+                return RefuseManualKill("Manual removal refused: the selected older cohort changed or is no longer eligible.");
+
+            if (!liveCodex.ContainsKey(currentCohort.Owner) || NativeProcess.CheckIdentity(currentCohort.Owner) != IdentityStatus.Match)
+                return RefuseManualKill("Manual removal refused: the exact Codex owner is no longer live.");
+
+            foreach (var identity in currentCohort.Members)
+            {
+                ProcessInfo helper;
+                if (!snapshot.TryGetValue(identity.Pid, out helper) || !helper.Identity.Equals(identity) ||
+                    !Classifier.IsManagedHelper(helper) || NativeProcess.CheckIdentity(identity) != IdentityStatus.Match)
+                    return RefuseManualKill("Manual removal refused: a cohort process changed during revalidation.");
+
+                ProcessInfo freshOwner = Lineage.FindCodexOwner(helper, snapshot);
+                if (freshOwner == null || !freshOwner.Identity.Equals(currentCohort.Owner))
+                    return RefuseManualKill("Manual removal refused: a cohort process is no longer attached to the selected Codex owner.");
+            }
+
+            if (NativeProcess.CheckIdentity(currentCohort.Owner) != IdentityStatus.Match)
+                return RefuseManualKill("Manual removal refused: the Codex owner changed during revalidation.");
+
+            int killed = 0;
+            foreach (var identity in currentCohort.Members.OrderByDescending(item => item.StartTicks))
+            {
+                try
+                {
+                    if (!NativeProcess.TryTerminate(identity)) continue;
+                    killed++;
+                    tracked.Remove(identity);
+                }
+                catch
+                {
+                    // Fail closed: leave anything that could not be revalidated and terminated exactly.
+                }
+            }
+            SaveState(statePath, tracked);
+            return new ManualKillResult(currentCohort.Members.Length, killed,
+                string.Format("Manual removal: {0}/{1} exact process(es) killed from the selected older cohort.", killed, currentCohort.Members.Length));
+        }
+
+        private ManualKillResult RefuseManualKill(string message)
+        {
+            SaveState(statePath, tracked);
+            return ManualKillResult.Refuse(message);
+        }
+
+        private Dictionary<ProcessIdentity, ProcessInfo> RefreshTrackedAndGetLiveCodex(Dictionary<int, ProcessInfo> snapshot)
+        {
+            var liveCodex = snapshot.Values.Where(p => p.Name == "codex.exe").ToDictionary(p => p.Identity, p => p);
+
+            // Forget exited/reused helper PIDs before considering any cleanup.
+            foreach (var key in tracked.Keys.ToList())
+            {
+                ProcessInfo current;
+                if (!snapshot.TryGetValue(key.Pid, out current) || !current.Identity.Equals(key)) tracked.Remove(key);
+            }
+
+            // Adopt only helpers whose complete ancestry reaches a currently live Codex identity.
+            foreach (var process in snapshot.Values)
+            {
+                if (!Classifier.IsManagedHelper(process)) continue;
+                ProcessInfo owner = Lineage.FindCodexOwner(process, snapshot);
+                if (owner == null) continue;
+                tracked[process.Identity] = new TrackedProcess(process.Identity, owner.Identity, 0, process.Name);
+            }
+            return liveCodex;
         }
 
         private static Dictionary<ProcessIdentity, TrackedProcess> LoadState(string path)
@@ -500,7 +618,7 @@ namespace CodexProcessGuard
 
             foreach (var ownerGroup in valid.GroupBy(item => item.Owner))
             {
-                var ordered = ownerGroup.OrderBy(item => item.Helper.StartTicks).ToList();
+                var ordered = ownerGroup.OrderBy(item => item.Helper.StartTicks).ThenBy(item => item.Helper.Pid).ToList();
                 var groups = new List<List<TrackedProcess>>();
                 foreach (var item in ordered)
                 {
@@ -536,14 +654,30 @@ namespace CodexProcessGuard
 
                     result.Add(new CohortInfo(
                         new DateTime(members[0].Helper.StartTicks, DateTimeKind.Utc).ToLocalTime(),
-                        ownerGroup.Key.Pid,
-                        members.Count,
+                        ownerGroup.Key,
+                        members.Select(item => item.Helper).ToArray(),
                         processes.Sum(process => process.WorkingSetBytes) / 1024d / 1024d,
                         processes.Count(process => socketPids.Contains(process.Id)),
                         types, services, decision));
                 }
             }
             return result.OrderByDescending(item => item.StartedLocal).ToList();
+        }
+
+        public static bool IsOlderLive(CohortInfo cohort)
+        {
+            return cohort != null && cohort.Decision.StartsWith("Older live cohort", StringComparison.Ordinal);
+        }
+
+        public static CohortInfo FindExactOlder(IEnumerable<CohortInfo> current, CohortInfo selected)
+        {
+            if (!IsOlderLive(selected)) return null;
+            return current.FirstOrDefault(item => IsOlderLive(item) && item.Owner.Equals(selected.Owner) && SameMembers(item.Members, selected.Members));
+        }
+
+        private static bool SameMembers(ProcessIdentity[] left, ProcessIdentity[] right)
+        {
+            return left.Length == right.Length && new HashSet<ProcessIdentity>(left).SetEquals(right);
         }
 
         private static string DisplayProcessType(string name)
@@ -822,18 +956,29 @@ namespace CodexProcessGuard
             Cohorts = cohorts;
         }
     }
+    internal sealed class ManualKillResult
+    {
+        public readonly int Requested, Killed;
+        public readonly string Message;
+        public ManualKillResult(int requested, int killed, string message) { Requested = requested; Killed = killed; Message = message; }
+        public static ManualKillResult Refuse(string message) { return new ManualKillResult(0, 0, message); }
+    }
     internal sealed class CohortInfo
     {
         public readonly DateTime StartedLocal;
-        public readonly int OwnerPid, ProcessCount, SocketProcesses;
+        public readonly ProcessIdentity Owner;
+        public readonly ProcessIdentity[] Members;
+        public int OwnerPid { get { return Owner.Pid; } }
+        public int ProcessCount { get { return Members.Length; } }
+        public readonly int SocketProcesses;
         public readonly double RamMegabytes;
         public readonly string ProcessTypes, Services, Decision;
-        public CohortInfo(DateTime startedLocal, int ownerPid, int processCount, double ramMegabytes, int socketProcesses,
+        public CohortInfo(DateTime startedLocal, ProcessIdentity owner, ProcessIdentity[] members, double ramMegabytes, int socketProcesses,
             string processTypes, string services, string decision)
         {
             StartedLocal = startedLocal;
-            OwnerPid = ownerPid;
-            ProcessCount = processCount;
+            Owner = owner;
+            Members = members;
             RamMegabytes = ramMegabytes;
             SocketProcesses = socketProcesses;
             ProcessTypes = processTypes;
@@ -943,6 +1088,20 @@ namespace CodexProcessGuard
                 Assert(builtCohorts.Count == 2);
                 Assert(builtCohorts[0].ProcessCount == 1 && builtCohorts[0].SocketProcesses == 1 && builtCohorts[0].Decision.StartsWith("Newest"));
                 Assert(builtCohorts[1].ProcessCount == 2 && builtCohorts[1].Decision.StartsWith("Older"));
+                Assert(CohortBuilder.FindExactOlder(builtCohorts, builtCohorts[1]) == builtCohorts[1]);
+                Assert(CohortBuilder.FindExactOlder(builtCohorts, builtCohorts[0]) == null);
+                var staleSelection = new CohortInfo(builtCohorts[1].StartedLocal, builtCohorts[1].Owner,
+                    new[] { cohortA.Identity, new ProcessIdentity(99, 99) }, builtCohorts[1].RamMegabytes,
+                    builtCohorts[1].SocketProcesses, builtCohorts[1].ProcessTypes, builtCohorts[1].Services, builtCohorts[1].Decision);
+                Assert(CohortBuilder.FindExactOlder(builtCohorts, staleSelection) == null);
+                var reorderedSelection = new CohortInfo(builtCohorts[1].StartedLocal, builtCohorts[1].Owner,
+                    new[] { cohortB.Identity, cohortA.Identity }, builtCohorts[1].RamMegabytes,
+                    builtCohorts[1].SocketProcesses, builtCohorts[1].ProcessTypes, builtCohorts[1].Services, builtCohorts[1].Decision);
+                Assert(CohortBuilder.FindExactOlder(builtCohorts, reorderedSelection) == builtCohorts[1]);
+                var wrongOwnerSelection = new CohortInfo(builtCohorts[1].StartedLocal, new ProcessIdentity(98, 98),
+                    builtCohorts[1].Members, builtCohorts[1].RamMegabytes, builtCohorts[1].SocketProcesses,
+                    builtCohorts[1].ProcessTypes, builtCohorts[1].Services, builtCohorts[1].Decision);
+                Assert(CohortBuilder.FindExactOlder(builtCohorts, wrongOwnerSelection) == null);
                 return 0;
             }
             catch { return 1; }
