@@ -28,7 +28,7 @@ void run(const char* name, const std::function<void()>& test) {
 
 guard::Process process(std::uint32_t pid, std::uint32_t parent, std::wstring name,
                        std::wstring command, std::uint64_t started, std::uint64_t working_set = 0) {
-    return {{pid, started}, parent, std::move(name), std::move(command), working_set};
+    return {{pid, started}, parent, std::move(name), std::move(command), working_set, true};
 }
 
 void classifier_tests() {
@@ -106,6 +106,7 @@ void native_snapshot_and_identity_tests() {
     CHECK(self != snapshot.end());
     CHECK(self->second.identity.started != 0);
     CHECK(self->second.working_set != 0);
+    if (self->second.name != L"guard_tests.exe") std::wcerr << L"snapshot self name: " << self->second.name << L'\n';
     CHECK(self->second.name == L"guard_tests.exe");
     CHECK(self->second.command_line.find(L"guard_tests") != std::wstring::npos);
     CHECK(guard::check_identity(self->second.identity) == guard::IdentityStatus::match);
@@ -146,7 +147,8 @@ void exact_child_termination_test() {
         CHECK(!guard::terminate_exact({identity.pid, identity.started + 1}));
         CHECK(WaitForSingleObject(child.hProcess, 0) == WAIT_TIMEOUT);
         CHECK(guard::terminate_exact(identity));
-        CHECK(WaitForSingleObject(child.hProcess, 2000) == WAIT_OBJECT_0);
+        CHECK(WaitForSingleObject(child.hProcess, 0) == WAIT_OBJECT_0);
+        CHECK(guard::check_identity(identity) == guard::IdentityStatus::missing);
     } catch (...) {
         TerminateProcess(child.hProcess, 99);
         CloseHandle(child.hProcess);
@@ -191,7 +193,7 @@ void tracking_state_machine_test() {
 
 void destructive_coordinator_test() {
     const auto owner = process(40, 1, L"codex.exe", L"codex app-server", 400);
-    const auto helper = process(41, 40, L"node.exe", L"node mongodb-mcp-server", 410);
+    const auto helper = process(41, 40, L"node.exe", L"node mongodb-mcp-server", 410, 64 * 1024 * 1024);
     guard::Snapshot live_snapshot{{40, owner}, {41, helper}};
     guard::Snapshot orphan_snapshot{{41, helper}};
     std::vector<guard::TrackedProcess> tracked;
@@ -201,16 +203,49 @@ void destructive_coordinator_test() {
     const auto candidates = guard::update_tracking(tracked, orphan_snapshot, {}).termination_candidates;
     bool terminated = false;
     CHECK(guard::terminate_candidates(tracked, orphan_snapshot, candidates,
-        [](guard::Identity) { return guard::IdentityStatus::match; }, [&](guard::Identity) { terminated = true; return true; }) == 0);
+        [](guard::Identity) { return guard::IdentityStatus::match; }, [&](guard::Identity) { terminated = true; return true; }).confirmed == 0);
     CHECK(!terminated && tracked[0].orphan_observations == 0);
 
     tracked[0].orphan_observations = 2;
     CHECK(guard::terminate_candidates(tracked, orphan_snapshot, candidates,
-        [](guard::Identity) { return guard::IdentityStatus::unknown; }, [&](guard::Identity) { terminated = true; return true; }) == 0);
+        [](guard::Identity) { return guard::IdentityStatus::unknown; }, [&](guard::Identity) { terminated = true; return true; }).confirmed == 0);
     CHECK(!terminated && tracked.size() == 1);
-    CHECK(guard::terminate_candidates(tracked, orphan_snapshot, candidates,
-        [](guard::Identity) { return guard::IdentityStatus::missing; }, [&](guard::Identity identity) { terminated = identity == helper.identity; return true; }) == 1);
+    const auto result = guard::terminate_candidates(tracked, orphan_snapshot, candidates,
+        [](guard::Identity) { return guard::IdentityStatus::missing; }, [&](guard::Identity identity) { terminated = identity == helper.identity; return true; });
+    CHECK(result.confirmed == 1);
+    CHECK(result.estimated_working_set == helper.working_set);
+    CHECK(result.events.size() == 1);
+    CHECK(result.events[0].helper == helper.identity && result.events[0].owner == owner.identity);
+    CHECK(result.events[0].working_set == helper.working_set);
     CHECK(terminated && tracked.empty());
+}
+
+void evidence_snapshot_test() {
+    const guard::Identity live_owner{50, 500};
+    const guard::Identity missing_owner{51, 510};
+    const auto live_helper = process(52, 50, L"node.exe", L"node mongodb-mcp-server", 520, 100 * 1024 * 1024);
+    const auto pending_helper = process(53, 51, L"node.exe", L"node mongodb-mcp-server", 530, 40 * 1024 * 1024);
+    auto unknown_helper = process(54, 50, L"node.exe", L"node mongodb-mcp-server", 540);
+    unknown_helper.working_set_known = false;
+    const auto retry_helper = process(55, 51, L"node.exe", L"node mongodb-mcp-server", 550, 20 * 1024 * 1024);
+    const auto ignored_child = process(56, 50, L"node.exe", L"node next dev", 560, 30 * 1024 * 1024);
+    const guard::Snapshot snapshot{{50, process(50, 1, L"codex.exe", L"codex app-server", 500)},
+                                   {52, live_helper}, {53, pending_helper}, {54, unknown_helper},
+                                   {55, retry_helper}, {56, ignored_child}};
+    const std::vector<guard::TrackedProcess> tracked{
+        {live_helper.identity, live_owner, 0, live_helper.name},
+        {pending_helper.identity, missing_owner, 1, pending_helper.name},
+        {unknown_helper.identity, live_owner, 0, unknown_helper.name},
+        {retry_helper.identity, missing_owner, 2, retry_helper.name}
+    };
+    const auto evidence = guard::build_evidence(tracked, snapshot, guard::IdentitySet{live_owner});
+    CHECK(evidence.managed == 4 && evidence.managed_working_set == 160 * 1024 * 1024);
+    CHECK(evidence.unknown_working_sets == 1);
+    CHECK(evidence.protected_live == 2 && evidence.protected_working_set == 100 * 1024 * 1024);
+    CHECK(evidence.waiting_confirmation == 1 && evidence.waiting_working_set == 40 * 1024 * 1024);
+    CHECK(evidence.eligible_preserved == 1 && evidence.eligible_working_set == 20 * 1024 * 1024);
+    CHECK(evidence.out_of_scope_codex == 1 && evidence.out_of_scope_working_set == 30 * 1024 * 1024);
+    CHECK(guard::saturating_add(UINT64_MAX, 1) == UINT64_MAX);
 }
 
 } // namespace
@@ -225,5 +260,6 @@ int main() {
     run("native termination rejects wrong identity and kills owned child", exact_child_termination_test);
     run("tracking never kills live owners and requires two orphan scans", tracking_state_machine_test);
     run("destructive coordinator fails closed and kills only exact candidates", destructive_coordinator_test);
+    run("evidence reports only exact currently observed helpers", evidence_snapshot_test);
     return failures == 0 ? 0 : 1;
 }

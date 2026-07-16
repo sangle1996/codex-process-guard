@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cwctype>
+#include <limits>
 #include <stdexcept>
 
 namespace guard {
@@ -170,10 +171,11 @@ TrackingUpdate update_tracking(std::vector<TrackedProcess>& tracked, const Snaps
     return result;
 }
 
-int terminate_candidates(std::vector<TrackedProcess>& tracked, const Snapshot& snapshot, const std::vector<Identity>& candidates,
-                         const std::function<IdentityStatus(Identity)>& check,
-                         const std::function<bool(Identity)>& terminate) {
-    int killed = 0;
+TerminationSummary terminate_candidates(std::vector<TrackedProcess>& tracked, const Snapshot& snapshot,
+                                        const std::vector<Identity>& candidates,
+                                        const std::function<IdentityStatus(Identity)>& check,
+                                        const std::function<bool(Identity)>& terminate) {
+    TerminationSummary result;
     for (const auto candidate : candidates) {
         const auto tracked_item = std::find_if(tracked.begin(), tracked.end(), [&](const TrackedProcess& item) { return item.helper == candidate; });
         const auto current = snapshot.find(candidate.pid);
@@ -181,10 +183,53 @@ int terminate_candidates(std::vector<TrackedProcess>& tracked, const Snapshot& s
         const auto owner_status = check(tracked_item->owner);
         if (owner_status == IdentityStatus::match) { tracked_item->orphan_observations = 0; continue; }
         if (owner_status == IdentityStatus::unknown || !terminate(candidate)) continue;
-        ++killed;
+        ++result.confirmed;
+        if (current->second.working_set_known) result.estimated_working_set = saturating_add(result.estimated_working_set, current->second.working_set);
+        else ++result.unknown_working_sets;
+        result.events.push_back({candidate, tracked_item->owner, current->second.working_set, current->second.working_set_known});
         tracked.erase(tracked_item);
     }
-    return killed;
+    return result;
+}
+
+EvidenceSnapshot build_evidence(const std::vector<TrackedProcess>& tracked, const Snapshot& snapshot,
+                                const IdentitySet& live_codex) {
+    EvidenceSnapshot result;
+    for (const auto& item : tracked) {
+        const auto process = snapshot.find(item.helper.pid);
+        if (process == snapshot.end() || process->second.identity != item.helper) continue;
+        ++result.managed;
+        if (process->second.working_set_known) result.managed_working_set = saturating_add(result.managed_working_set, process->second.working_set);
+        else ++result.unknown_working_sets;
+        if (live_codex.contains(item.owner)) {
+            ++result.protected_live;
+            if (process->second.working_set_known) result.protected_working_set = saturating_add(result.protected_working_set, process->second.working_set);
+        } else {
+            ++result.pending;
+            if (process->second.working_set_known) result.pending_working_set = saturating_add(result.pending_working_set, process->second.working_set);
+            if (item.orphan_observations < 2) {
+                ++result.waiting_confirmation;
+                if (process->second.working_set_known) result.waiting_working_set = saturating_add(result.waiting_working_set, process->second.working_set);
+            } else {
+                ++result.eligible_preserved;
+                if (process->second.working_set_known) result.eligible_working_set = saturating_add(result.eligible_working_set, process->second.working_set);
+            }
+        }
+    }
+    for (const auto& [pid, process] : snapshot) {
+        static_cast<void>(pid);
+        if (lower(process.name) == L"codex.exe" || is_managed_helper(process)) continue;
+        const auto owner = find_codex_owner(process, snapshot);
+        if (!owner || !live_codex.contains(*owner)) continue;
+        ++result.out_of_scope_codex;
+        if (process.working_set_known) result.out_of_scope_working_set = saturating_add(result.out_of_scope_working_set, process.working_set);
+        else ++result.out_of_scope_unknown_working_sets;
+    }
+    return result;
+}
+
+std::uint64_t saturating_add(std::uint64_t left, std::uint64_t right) {
+    return right > std::numeric_limits<std::uint64_t>::max() - left ? std::numeric_limits<std::uint64_t>::max() : left + right;
 }
 
 } // namespace guard

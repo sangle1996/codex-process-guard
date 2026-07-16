@@ -94,10 +94,10 @@ Snapshot read_process_snapshot() {
         std::uint64_t started = 0;
         if (!process || !read_start_time(process.value, started)) continue;
         PROCESS_MEMORY_COUNTERS_EX memory{sizeof(memory)};
-        const auto working_set = GetProcessMemoryInfo(process.value, reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&memory), sizeof(memory))
-            ? static_cast<std::uint64_t>(memory.WorkingSetSize) : 0;
+        const bool working_set_known = GetProcessMemoryInfo(process.value, reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&memory), sizeof(memory)) != FALSE;
+        const auto working_set = working_set_known ? static_cast<std::uint64_t>(memory.WorkingSetSize) : 0;
         result.emplace(entry.th32ProcessID, Process{{entry.th32ProcessID, started}, entry.th32ParentProcessID,
-            entry.szExeFile, read_command_line(process.value), working_set});
+            entry.szExeFile, read_command_line(process.value), working_set, working_set_known});
     } while (Process32NextW(snapshot.value, &entry));
     return result;
 }
@@ -113,12 +113,12 @@ IdentityStatus check_identity(Identity expected) {
 }
 
 bool terminate_exact(Identity expected) {
-    Handle process(OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, expected.pid));
+    Handle process(OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, expected.pid));
     if (!process) return false;
     std::uint64_t started = 0;
     bool exited = false;
     if (!read_start_time(process.value, started, &exited) || exited || started != expected.started) return false;
-    return TerminateProcess(process.value, 1) != FALSE;
+    return TerminateProcess(process.value, 1) && WaitForSingleObject(process.value, 2000) == WAIT_OBJECT_0;
 }
 
 std::unordered_set<std::uint32_t> read_tcp_owner_pids() {

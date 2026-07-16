@@ -43,12 +43,35 @@ struct CohortRow {
 
 struct ScanResult {
     int memory_percent{};
+    std::uint64_t physical_used{};
+    std::uint64_t physical_total{};
+    bool physical_memory_known{};
     int roots{};
     int live_attached{};
     int pending{};
     int killed{};
+    std::uint64_t estimated_released{};
+    int estimated_unknown{};
+    EvidenceSnapshot evidence;
+    std::uint64_t guard_working_set{};
+    bool guard_working_set_known{};
     long long elapsed_ms{};
     std::vector<CohortRow> rows;
+};
+
+struct EvidenceTotals {
+    std::uint64_t scans{};
+    std::uint64_t auto_confirmed{};
+    std::uint64_t manual_confirmed{};
+    std::uint64_t estimated_released{};
+    std::uint64_t unknown_released{};
+};
+
+struct SystemMemory {
+    int percent{};
+    std::uint64_t used{};
+    std::uint64_t total{};
+    bool known{};
 };
 
 std::wstring lower(std::wstring value) {
@@ -106,9 +129,16 @@ std::wstring decision_text(CohortDecision decision) {
     return L"Owner gone - automatic two-scan policy";
 }
 
-int memory_load() {
+SystemMemory system_memory() {
     MEMORYSTATUSEX status{sizeof(status)};
-    return GlobalMemoryStatusEx(&status) ? static_cast<int>(status.dwMemoryLoad) : 0;
+    if (!GlobalMemoryStatusEx(&status)) return {};
+    return {static_cast<int>(status.dwMemoryLoad), status.ullTotalPhys - status.ullAvailPhys, status.ullTotalPhys, true};
+}
+
+std::wstring megabytes(std::uint64_t bytes) {
+    std::wostringstream output;
+    output << std::fixed << std::setprecision(1) << static_cast<double>(bytes) / 1024.0 / 1024.0;
+    return output.str();
 }
 
 class App {
@@ -129,6 +159,7 @@ public:
         std::filesystem::create_directories(data_directory_);
         settings_ = load_settings();
         tracked_ = load_tracking();
+        totals_ = load_evidence_totals();
 
         INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_LISTVIEW_CLASSES};
         InitCommonControlsEx(&controls);
@@ -143,7 +174,7 @@ public:
 
         window_ = CreateWindowExW(0, class_name, L"Codex Process Guard Native",
             WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-            CW_USEDEFAULT, CW_USEDEFAULT, 1160, 720, nullptr, nullptr, instance, this);
+            CW_USEDEFAULT, CW_USEDEFAULT, 1160, 920, nullptr, nullptr, instance, this);
         if (!window_) return 1;
         create_controls();
         add_tray_icon();
@@ -151,6 +182,8 @@ public:
         apply_timer();
         load_recent_log();
         append_log(L"Native guard started. Automatic cleanup preserves live Codex owners.");
+        if (evidence_history_new_) append_log(L"Local evidence history started this run; no earlier totals were available.");
+        if (!evidence_history_valid_) append_log(L"Evidence history was missing or invalid and was reset; current measurements are unaffected.");
         scan(true);
         append_log(show_balloon(L"Codex Process Guard Native", L"Running in the notification area. Automatic scans are active.")
             ? L"Startup notification sent." : L"Startup notification unavailable; keeping the window visible.");
@@ -169,14 +202,15 @@ public:
 
 private:
     HINSTANCE instance_{};
-    HWND window_{}, interval_{}, startup_{}, status_{}, next_scan_{}, list_{}, log_{}, kill_{};
+    HWND window_{}, interval_{}, startup_{}, status_{}, next_scan_{}, evidence_{}, list_{}, log_{}, kill_{};
     HANDLE mutex_{};
     NOTIFYICONDATAW tray_{};
     Settings settings_;
+    EvidenceTotals totals_;
     std::filesystem::path data_directory_;
     std::vector<TrackedProcess> tracked_;
     std::vector<CohortRow> rows_;
-    bool exiting_{}, tray_added_{};
+    bool exiting_{}, tray_added_{}, evidence_history_valid_{true}, evidence_history_new_{};
     UINT taskbar_created_{};
 
     static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
@@ -257,9 +291,12 @@ private:
         control(L"BUTTON", L"Hide to tray", BS_PUSHBUTTON, 387, 126, 110, 28, id_hide);
         status_ = control(L"STATIC", L"Status: starting...", SS_LEFT, 18, 172, 1090, 22);
         next_scan_ = control(L"STATIC", L"Next scan: -", SS_LEFT, 18, 196, 600, 22);
-        control(L"STATIC", L"Managed process cohorts", SS_LEFT, 18, 224, 300, 22);
+        control(L"STATIC", L"Verification and scope evidence", SS_LEFT, 18, 224, 420, 22);
+        evidence_ = control(L"EDIT", L"Collecting first measurement...", WS_BORDER | ES_MULTILINE | ES_READONLY,
+                            18, 246, 1100, 150);
+        control(L"STATIC", L"Managed process cohorts", SS_LEFT, 18, 406, 300, 22);
 
-        list_ = control(WC_LISTVIEWW, L"", LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_BORDER, 18, 246, 1100, 250, id_list);
+        list_ = control(WC_LISTVIEWW, L"", LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_BORDER, 18, 428, 1100, 250, id_list);
         ListView_SetExtendedListViewStyle(list_, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
         const wchar_t* headers[] = {L"Started", L"Age", L"Owner PID", L"Proc", L"RAM MB", L"TCP", L"Process types", L"MCP groups", L"Safety decision"};
         const int widths[] = {75, 65, 72, 48, 66, 45, 170, 290, 250};
@@ -267,8 +304,8 @@ private:
             LVCOLUMNW column{LVCF_TEXT | LVCF_WIDTH, 0, widths[index], const_cast<LPWSTR>(headers[index])};
             ListView_InsertColumn(list_, index, &column);
         }
-        control(L"STATIC", L"Recent native-scan log", SS_LEFT, 18, 506, 300, 22);
-        log_ = control(L"EDIT", L"", WS_BORDER | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL, 18, 528, 1100, 130);
+        control(L"STATIC", L"Recent native-scan log", SS_LEFT, 18, 688, 300, 22);
+        log_ = control(L"EDIT", L"", WS_BORDER | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL, 18, 710, 1100, 150);
     }
 
     void add_tray_icon() {
@@ -326,6 +363,50 @@ private:
         std::wofstream output(data_directory_ / L"settings.ini", std::ios::trunc);
         output << L"IntervalMinutes=" << settings_.interval_minutes << L"\nStartWithWindows="
                << (settings_.start_with_windows ? L"true" : L"false") << L'\n';
+    }
+
+    EvidenceTotals load_evidence_totals() {
+        EvidenceTotals result;
+        const auto path = data_directory_ / L"evidence.ini";
+        if (!std::filesystem::exists(path)) { evidence_history_new_ = true; return result; }
+        std::wifstream input(path);
+        std::wstring key;
+        std::uint64_t value = 0;
+        bool version_seen = false, scans_seen = false, auto_seen = false, manual_seen = false;
+        bool estimate_seen = false, unknown_seen = false;
+        while (input >> key >> value) {
+            if (key == L"version" && !version_seen) {
+                if (value != 1) { evidence_history_valid_ = false; return {}; }
+                version_seen = true;
+            }
+            else if (key == L"scans" && !scans_seen) { result.scans = value; scans_seen = true; }
+            else if (key == L"auto_confirmed" && !auto_seen) { result.auto_confirmed = value; auto_seen = true; }
+            else if (key == L"manual_confirmed" && !manual_seen) { result.manual_confirmed = value; manual_seen = true; }
+            else if (key == L"observed_pre_kill_ws" && !estimate_seen) { result.estimated_released = value; estimate_seen = true; }
+            else if (key == L"unknown_pre_kill_ws" && !unknown_seen) { result.unknown_released = value; unknown_seen = true; }
+            else { evidence_history_valid_ = false; return {}; }
+        }
+        evidence_history_valid_ = input.eof() && version_seen && scans_seen && auto_seen && manual_seen && estimate_seen && unknown_seen;
+        if (!evidence_history_valid_) return {};
+        return result;
+    }
+
+    bool save_evidence_totals() const {
+        try {
+            const auto path = data_directory_ / L"evidence.ini";
+            const auto temporary = data_directory_ / L"evidence.tmp";
+            std::filesystem::remove(temporary);
+            std::wofstream output(temporary, std::ios::trunc);
+            output << L"version 1\nscans " << totals_.scans << L"\nauto_confirmed " << totals_.auto_confirmed
+                   << L"\nmanual_confirmed " << totals_.manual_confirmed << L"\nobserved_pre_kill_ws "
+                   << totals_.estimated_released << L"\nunknown_pre_kill_ws " << totals_.unknown_released << L'\n';
+            output.flush();
+            if (!output) return false;
+            output.close();
+            if (MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) return true;
+            std::filesystem::remove(temporary);
+            return false;
+        } catch (...) { return false; }
     }
 
     std::vector<TrackedProcess> load_tracking() const {
@@ -460,17 +541,19 @@ private:
         for (const auto& cohort : cohorts) {
             std::map<std::wstring, int> types, services;
             std::uint64_t ram = 0;
-            int tcp = 0;
+            int tcp = 0, unknown_ram = 0;
             for (const auto& identity : cohort.members) {
                 const auto found = snapshot.find(identity.pid);
                 if (found == snapshot.end() || found->second.identity != identity) continue;
                 ++types[process_type(found->second.name)];
                 ++services[service_name(found->second).value_or(L"Unknown")];
-                ram += found->second.working_set;
+                if (found->second.working_set_known) ram = saturating_add(ram, found->second.working_set);
+                else ++unknown_ram;
                 if (tcp_owners.contains(identity.pid)) ++tcp;
             }
+            const auto ram_text = megabytes(ram) + (unknown_ram ? L" + " + std::to_wstring(unknown_ram) + L" unknown" : L"");
             result.push_back({cohort, {started_text(cohort.started), age_text(cohort.started), std::to_wstring(cohort.owner.pid),
-                std::to_wstring(cohort.members.size()), std::to_wstring(ram / 1024 / 1024), std::to_wstring(tcp),
+                std::to_wstring(cohort.members.size()), ram_text, std::to_wstring(tcp),
                 join_counts(types), join_counts(services), decision_text(cohort.decision)}});
         }
         return result;
@@ -481,13 +564,32 @@ private:
         const auto snapshot = read_process_snapshot();
         const auto owners = live_codex(snapshot);
         auto update = update_tracking(tracked_, snapshot, owners, observe_orphans);
-        const int killed = terminate_candidates(tracked_, snapshot, update.termination_candidates, check_identity, terminate_exact);
+        const auto removed = terminate_candidates(tracked_, snapshot, update.termination_candidates, check_identity, terminate_exact);
         const bool state_saved = save_tracking();
         const auto cohorts = build_cohorts(tracked_, snapshot, owners);
+        const auto evidence = build_evidence(tracked_, snapshot, owners);
         const auto rows = make_rows(cohorts, snapshot, read_tcp_owner_pids());
+        const auto self = snapshot.find(GetCurrentProcessId());
+        const auto guard_working_set = self == snapshot.end() ? 0 : self->second.working_set;
+        const bool guard_working_set_known = self != snapshot.end() && self->second.working_set_known;
+        const auto memory = system_memory();
         const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
+        totals_.scans = saturating_add(totals_.scans, 1);
+        totals_.auto_confirmed = saturating_add(totals_.auto_confirmed, static_cast<std::uint64_t>(removed.confirmed));
+        totals_.estimated_released = saturating_add(totals_.estimated_released, removed.estimated_working_set);
+        totals_.unknown_released = saturating_add(totals_.unknown_released, static_cast<std::uint64_t>(removed.unknown_working_sets));
+        for (const auto& event : removed.events) {
+            append_log(L"AUTO_CONFIRMED helper PID=" + std::to_wstring(event.helper.pid) + L", created=" +
+                       std::to_wstring(event.helper.started) + L", owner PID=" + std::to_wstring(event.owner.pid) +
+                       L", pre-kill WS=" + (event.working_set_known ? megabytes(event.working_set) + L" MB" : L"unavailable") +
+                       L"; process exit handle signaled.");
+        }
         if (!state_saved) append_log(L"State save failed; process safety remained fail-closed.");
-        return {memory_load(), static_cast<int>(owners.size()), update.live_attached, (std::max)(0, update.pending - killed), killed, elapsed, rows};
+        if (!save_evidence_totals()) append_log(L"Evidence totals save failed; current measurements remain valid.");
+        return {memory.percent, memory.used, memory.total, memory.known, static_cast<int>(owners.size()), update.live_attached,
+                (std::max)(0, update.pending - removed.confirmed), removed.confirmed,
+                removed.estimated_working_set, removed.unknown_working_sets, evidence, guard_working_set,
+                guard_working_set_known, elapsed, rows};
     }
 
     void scan(bool observe_orphans) {
@@ -496,13 +598,42 @@ private:
         const auto result = perform_scan(observe_orphans);
         rows_ = result.rows;
         populate_rows();
-        wchar_t status[256]{};
-        swprintf_s(status, L"Status: RAM %d%%, %d Codex root(s), %d live-attached, %d pending, %d killed. Native scan %lld ms.",
-            result.memory_percent, result.roots, result.live_attached, result.pending, result.killed, result.elapsed_ms);
-        SetWindowTextW(status_, status);
+        std::wostringstream status;
+        status << L"Status: RAM " << (result.physical_memory_known ? std::to_wstring(result.memory_percent) + L"%" : L"unavailable")
+               << L", " << result.roots << L" Codex root(s), " << result.live_attached << L" live-attached, "
+               << result.pending << L" pending, " << result.killed << L" killed. Native scan " << result.elapsed_ms << L" ms.";
+        SetWindowTextW(status_, status.str().c_str());
+        update_evidence(result);
         apply_timer();
-        append_log(status);
+        append_log(status.str() + L" Managed set " + std::to_wstring(result.evidence.managed) + L"/" +
+                   megabytes(result.evidence.managed_working_set) + L" MB observed; confirmed pre-kill WS " +
+                   megabytes(result.estimated_released) + L" MB (" + std::to_wstring(result.estimated_unknown) + L" unavailable)." );
         if (result.killed > 0) show_balloon(L"Native cleanup complete", std::to_wstring(result.killed) + L" orphaned helper process(es) removed.");
+    }
+
+    void update_evidence(const ScanResult& result) {
+        std::wostringstream text;
+        text << L"SYSTEM CONTEXT: ";
+        if (result.physical_memory_known) text << L"physical RAM observed at " << result.memory_percent << L"%, "
+             << megabytes(result.physical_used) << L" / " << megabytes(result.physical_total) << L" MB in use.";
+        else text << L"physical RAM unavailable.";
+        text << L"\r\nCURRENT MANAGED SET: " << result.evidence.managed << L" recognized helper(s) with exact identities; "
+             << megabytes(result.evidence.managed_working_set) << L" MB WS observed, "
+             << result.evidence.unknown_working_sets << L" WS unavailable.\r\n"
+             << L"OUT OF SCOPE: " << result.evidence.out_of_scope_codex << L" other live Codex descendant(s), "
+             << megabytes(result.evidence.out_of_scope_working_set) << L" MB WS observed, "
+             << result.evidence.out_of_scope_unknown_working_sets << L" unavailable; all non-Codex apps are excluded.\r\n"
+             << L"SAFETY DECISION: " << result.evidence.protected_live << L" protected by live owners; "
+             << result.evidence.waiting_confirmation << L" awaiting second observation; "
+             << result.evidence.eligible_preserved << L" eligible but preserved because exit was not confirmed.\r\n"
+             << L"VERIFIED EXITS / LOCAL HISTORY" << (evidence_history_new_ ? L" (started this run)" : L"")
+             << L": this scan " << result.killed << L"; recorded "
+             << totals_.auto_confirmed << L" automatic + " << totals_.manual_confirmed << L" manual across "
+             << totals_.scans << L" scan(s). Observed pre-kill WS " << megabytes(totals_.estimated_released)
+             << L" MB; " << totals_.unknown_released << L" confirmed exit(s) had unavailable WS.\r\n"
+             << L"COST / METHOD: Guard " << (result.guard_working_set_known ? megabytes(result.guard_working_set) + L" MB" : L"WS unavailable")
+             << L"; scan " << result.elapsed_ms << L" ms. Confirmed = exact PID + creation time exited; WS is not system-RAM saved.";
+        SetWindowTextW(evidence_, text.str().c_str());
     }
 
     void populate_rows() {
@@ -562,13 +693,28 @@ private:
         auto members = exact->members;
         std::ranges::sort(members, [](const Identity& left, const Identity& right) { return left.started > right.started; });
         int killed = 0;
+        std::uint64_t estimated_released = 0;
+        int unknown_working_sets = 0;
         for (const auto identity : members) {
             if (!terminate_exact(identity)) continue;
             ++killed;
+            const auto& process = snapshot.at(identity.pid);
+            if (process.working_set_known) estimated_released = saturating_add(estimated_released, process.working_set);
+            else ++unknown_working_sets;
+            append_log(L"MANUAL_CONFIRMED helper PID=" + std::to_wstring(identity.pid) + L", created=" +
+                       std::to_wstring(identity.started) + L", owner PID=" + std::to_wstring(exact->owner.pid) +
+                       L", pre-kill WS=" + (process.working_set_known ? megabytes(process.working_set) + L" MB" : L"unavailable") +
+                       L"; process exit handle signaled.");
             std::erase_if(tracked_, [&](const TrackedProcess& item) { return item.helper == identity; });
         }
+        totals_.manual_confirmed = saturating_add(totals_.manual_confirmed, static_cast<std::uint64_t>(killed));
+        totals_.estimated_released = saturating_add(totals_.estimated_released, estimated_released);
+        totals_.unknown_released = saturating_add(totals_.unknown_released, static_cast<std::uint64_t>(unknown_working_sets));
         save_tracking();
-        append_log(L"Manual removal killed " + std::to_wstring(killed) + L"/" + std::to_wstring(members.size()) + L" exact process(es).");
+        if (!save_evidence_totals()) append_log(L"Evidence totals save failed after manual removal.");
+        append_log(L"Manual removal confirmed " + std::to_wstring(killed) + L"/" + std::to_wstring(members.size()) +
+                   L" exact process exit(s); observed " + megabytes(estimated_released) + L" MB pre-kill WS (" +
+                   std::to_wstring(unknown_working_sets) + L" unavailable)." );
         scan(false);
     }
 
