@@ -294,7 +294,7 @@ private:
         control(L"BUTTON", L"Hide to tray", BS_PUSHBUTTON, 387, 126, 110, 28, id_hide);
         status_ = control(L"STATIC", L"Status: starting...", SS_LEFT, 18, 172, 1090, 22);
         next_scan_ = control(L"STATIC", L"Next scan: -", SS_LEFT, 18, 196, 600, 22);
-        control(L"STATIC", L"Kết quả", SS_LEFT, 18, 224, 420, 22);
+        control(L"STATIC", L"Cleanup results", SS_LEFT, 18, 224, 420, 22);
         evidence_ = control(L"EDIT", L"Collecting first measurement...", WS_BORDER | ES_MULTILINE | ES_READONLY,
                             18, 246, 1100, 150);
         control(L"STATIC", L"Managed process cohorts", SS_LEFT, 18, 406, 300, 22);
@@ -683,23 +683,23 @@ private:
             : CleanupSummary{};
         const auto suspicious = result.evidence.waiting_confirmation + result.evidence.eligible_preserved;
         std::wostringstream text;
-        text << L"1 GIỜ QUA: ";
-        if (!recent_time_known) text << L"Không đọc được thời gian; chưa thể tính.";
-        else text << L"Đã dọn " << recent.confirmed << L" process (" << recent.automatic
-                       << L" tự động); RAM process trước khi dọn khoảng " << megabytes(recent.observed_working_set) << L" MB"
-                       << (recent.unknown_working_sets ? L" + " + std::to_wstring(recent.unknown_working_sets) + L" process chưa đo được RAM" : L"")
-                       << L" (không phải RAM hệ thống giảm thực tế)"
-                       << (cleanup_history_valid_ ? L"." : L"; lịch sử có thể thiếu.");
-        text << L"\r\nHIỆN TẠI: " << result.evidence.protected_live << L" process Codex đang dùng được giữ an toàn; "
-             << suspicious << L" process nghi ngờ đang chờ xác nhận."
-             << L"\r\nBẢO VỆ: Tự động không dọn process có Codex owner còn sống; dọn thủ công cần bạn xác nhận."
-             << L"\r\nCHI PHÍ APP: " << (result.guard_working_set_known ? megabytes(result.guard_working_set) + L" MB RAM" : L"không đo được RAM")
-             << L"; mỗi lần quét " << result.elapsed_ms << L" ms; quét " << settings_.interval_minutes << L" phút/lần."
-             << L"\r\nTỔNG GHI NHẬN" << (evidence_history_new_ || !evidence_history_valid_ ? L" (từ lần mở này)" : L"")
-             << L": Đã dọn " << saturating_add(totals_.auto_confirmed, totals_.manual_confirmed)
-             << L" process; RAM process trước khi dọn khoảng " << megabytes(totals_.estimated_released) << L" MB"
-             << (totals_.unknown_released ? L" + " + std::to_wstring(totals_.unknown_released) + L" process chưa đo được RAM" : L"")
-             << L" (không phải RAM hệ thống giảm thực tế).";
+        text << L"LAST 60 MINUTES: ";
+        if (!recent_time_known) text << L"Clock unavailable; recent cleanup cannot be calculated.";
+        else text << recent.confirmed << L" confirmed cleanup(s) (" << recent.automatic
+                  << L" automatic); pre-exit process WS " << megabytes(recent.observed_working_set) << L" MB"
+                  << (recent.unknown_working_sets ? L" + " + std::to_wstring(recent.unknown_working_sets) + L" unknown WS" : L"")
+                  << L" (not measured system RAM saved)"
+                  << (cleanup_history_valid_ ? L"." : L"; history may be incomplete.");
+        text << L"\r\nCURRENT DECISION: " << result.evidence.protected_live << L" protected by an exact live Codex owner; "
+             << suspicious << L" waiting/eligible because the exact owner was not observed in this scan."
+             << L"\r\nSAFETY RULE: No age or idle timeout. Automatic cleanup requires the exact owner identity to be missing in two consecutive observing scans."
+             << L"\r\nGUARD COST: " << (result.guard_working_set_known ? megabytes(result.guard_working_set) + L" MB RAM" : L"RAM unavailable")
+             << L"; scan " << result.elapsed_ms << L" ms every " << settings_.interval_minutes << L" minute(s)."
+             << L"\r\nALL RECORDED" << (evidence_history_new_ || !evidence_history_valid_ ? L" (this run only)" : L"")
+             << L": " << saturating_add(totals_.auto_confirmed, totals_.manual_confirmed)
+             << L" confirmed cleanup(s); pre-exit process WS " << megabytes(totals_.estimated_released) << L" MB"
+             << (totals_.unknown_released ? L" + " + std::to_wstring(totals_.unknown_released) + L" unknown WS" : L"")
+             << L" (not measured system RAM saved).";
         SetWindowTextW(evidence_, text.str().c_str());
     }
 

@@ -1,6 +1,6 @@
 # Codex Process Guard Native
 
-A dependency-free C++20/Win32 rewrite of Codex Process Guard for Windows. Automatic cleanup preserves every recognized helper whose exact Codex owner is alive, and requires the same orphan identity to be observed in two scans before automatic termination.
+A dependency-free C++20/Win32 rewrite of Codex Process Guard for Windows. Automatic cleanup preserves every recognized helper whose exact Codex owner is alive. There is no age or idle timeout; cleanup requires that exact owner identity to be missing for the same helper in two consecutive observing scans.
 
 ## Safety model
 
