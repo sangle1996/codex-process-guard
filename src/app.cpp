@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <ctime>
 #include <cwctype>
 #include <deque>
 #include <filesystem>
@@ -160,6 +161,7 @@ public:
         settings_ = load_settings();
         tracked_ = load_tracking();
         totals_ = load_evidence_totals();
+        cleanup_records_ = load_cleanup_records();
 
         INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_LISTVIEW_CLASSES};
         InitCommonControlsEx(&controls);
@@ -210,7 +212,8 @@ private:
     std::filesystem::path data_directory_;
     std::vector<TrackedProcess> tracked_;
     std::vector<CohortRow> rows_;
-    bool exiting_{}, tray_added_{}, evidence_history_valid_{true}, evidence_history_new_{};
+    std::vector<CleanupRecord> cleanup_records_;
+    bool exiting_{}, tray_added_{}, evidence_history_valid_{true}, evidence_history_new_{}, cleanup_history_valid_{true};
     UINT taskbar_created_{};
 
     static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
@@ -291,7 +294,7 @@ private:
         control(L"BUTTON", L"Hide to tray", BS_PUSHBUTTON, 387, 126, 110, 28, id_hide);
         status_ = control(L"STATIC", L"Status: starting...", SS_LEFT, 18, 172, 1090, 22);
         next_scan_ = control(L"STATIC", L"Next scan: -", SS_LEFT, 18, 196, 600, 22);
-        control(L"STATIC", L"Verification and scope evidence", SS_LEFT, 18, 224, 420, 22);
+        control(L"STATIC", L"Kết quả", SS_LEFT, 18, 224, 420, 22);
         evidence_ = control(L"EDIT", L"Collecting first measurement...", WS_BORDER | ES_MULTILINE | ES_READONLY,
                             18, 246, 1100, 150);
         control(L"STATIC", L"Managed process cohorts", SS_LEFT, 18, 406, 300, 22);
@@ -407,6 +410,64 @@ private:
             std::filesystem::remove(temporary);
             return false;
         } catch (...) { return false; }
+    }
+
+    std::vector<CleanupRecord> load_cleanup_records() {
+        std::vector<CleanupRecord> result;
+        const auto path = data_directory_ / L"cleanup.tsv";
+        if (!std::filesystem::exists(path)) return result;
+        std::wifstream input(path);
+        if (!input) { cleanup_history_valid_ = false; return result; }
+        const auto raw_now = std::time(nullptr);
+        if (raw_now < 0) { cleanup_history_valid_ = false; return result; }
+        const auto now = static_cast<std::uint64_t>(raw_now);
+        std::wstring line;
+        while (std::getline(input, line)) {
+            CleanupRecord record;
+            int known = 0, automatic = 0;
+            std::wstring extra;
+            std::wistringstream row(line);
+            if (row >> record.timestamp >> record.working_set >> known >> automatic &&
+                !(row >> extra) && record.timestamp && record.timestamp <= now &&
+                (known == 0 || known == 1) && (automatic == 0 || automatic == 1)) {
+                record.working_set_known = known != 0;
+                record.automatic = automatic != 0;
+                if (now - record.timestamp <= 60 * 60) result.push_back(record);
+            } else cleanup_history_valid_ = false;
+        }
+        return result;
+    }
+
+    bool save_cleanup_records() const {
+        try {
+            const auto path = data_directory_ / L"cleanup.tsv";
+            const auto temporary = data_directory_ / L"cleanup.tmp";
+            std::filesystem::remove(temporary);
+            std::wofstream output(temporary, std::ios::trunc);
+            for (const auto& record : cleanup_records_)
+                output << record.timestamp << L'\t' << record.working_set << L'\t'
+                       << record.working_set_known << L'\t' << record.automatic << L'\n';
+            output.flush();
+            if (!output) return false;
+            output.close();
+            if (MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) return true;
+            std::filesystem::remove(temporary);
+            return false;
+        } catch (...) { return false; }
+    }
+
+    bool record_cleanup(std::uint64_t working_set, bool known, bool automatic) {
+        const auto raw_now = std::time(nullptr);
+        if (raw_now < 0) { cleanup_history_valid_ = false; return false; }
+        const auto now = static_cast<std::uint64_t>(raw_now);
+        std::erase_if(cleanup_records_, [&](const CleanupRecord& item) {
+            return !item.timestamp || item.timestamp > now || now - item.timestamp > 60 * 60;
+        });
+        const CleanupRecord record{now, working_set, known, automatic};
+        cleanup_records_.push_back(record);
+        if (save_cleanup_records()) return true;
+        cleanup_history_valid_ = false;
+        return false;
     }
 
     std::vector<TrackedProcess> load_tracking() const {
@@ -579,6 +640,8 @@ private:
         totals_.estimated_released = saturating_add(totals_.estimated_released, removed.estimated_working_set);
         totals_.unknown_released = saturating_add(totals_.unknown_released, static_cast<std::uint64_t>(removed.unknown_working_sets));
         for (const auto& event : removed.events) {
+            if (!record_cleanup(event.working_set, event.working_set_known, true))
+                append_log(L"Recent cleanup history save failed; the 1-hour summary may be incomplete after restart.");
             append_log(L"AUTO_CONFIRMED helper PID=" + std::to_wstring(event.helper.pid) + L", created=" +
                        std::to_wstring(event.helper.started) + L", owner PID=" + std::to_wstring(event.owner.pid) +
                        L", pre-kill WS=" + (event.working_set_known ? megabytes(event.working_set) + L" MB" : L"unavailable") +
@@ -612,27 +675,31 @@ private:
     }
 
     void update_evidence(const ScanResult& result) {
+        const auto raw_now = std::time(nullptr);
+        const bool recent_time_known = raw_now >= 0;
+        if (!recent_time_known) cleanup_history_valid_ = false;
+        const auto recent = recent_time_known
+            ? summarize_cleanup(cleanup_records_, static_cast<std::uint64_t>(raw_now), 60 * 60)
+            : CleanupSummary{};
+        const auto suspicious = result.evidence.waiting_confirmation + result.evidence.eligible_preserved;
         std::wostringstream text;
-        text << L"SYSTEM CONTEXT: ";
-        if (result.physical_memory_known) text << L"physical RAM observed at " << result.memory_percent << L"%, "
-             << megabytes(result.physical_used) << L" / " << megabytes(result.physical_total) << L" MB in use.";
-        else text << L"physical RAM unavailable.";
-        text << L"\r\nCURRENT MANAGED SET: " << result.evidence.managed << L" recognized helper(s) with exact identities; "
-             << megabytes(result.evidence.managed_working_set) << L" MB WS observed, "
-             << result.evidence.unknown_working_sets << L" WS unavailable.\r\n"
-             << L"OUT OF SCOPE: " << result.evidence.out_of_scope_codex << L" other live Codex descendant(s), "
-             << megabytes(result.evidence.out_of_scope_working_set) << L" MB WS observed, "
-             << result.evidence.out_of_scope_unknown_working_sets << L" unavailable; all non-Codex apps are excluded.\r\n"
-             << L"SAFETY DECISION: " << result.evidence.protected_live << L" protected by live owners; "
-             << result.evidence.waiting_confirmation << L" awaiting second observation; "
-             << result.evidence.eligible_preserved << L" eligible but preserved because exit was not confirmed.\r\n"
-             << L"VERIFIED EXITS / LOCAL HISTORY" << (evidence_history_new_ ? L" (started this run)" : L"")
-             << L": this scan " << result.killed << L"; recorded "
-             << totals_.auto_confirmed << L" automatic + " << totals_.manual_confirmed << L" manual across "
-             << totals_.scans << L" scan(s). Observed pre-kill WS " << megabytes(totals_.estimated_released)
-             << L" MB; " << totals_.unknown_released << L" confirmed exit(s) had unavailable WS.\r\n"
-             << L"COST / METHOD: Guard " << (result.guard_working_set_known ? megabytes(result.guard_working_set) + L" MB" : L"WS unavailable")
-             << L"; scan " << result.elapsed_ms << L" ms. Confirmed = exact PID + creation time exited; WS is not system-RAM saved.";
+        text << L"1 GIỜ QUA: ";
+        if (!recent_time_known) text << L"Không đọc được thời gian; chưa thể tính.";
+        else text << L"Đã dọn " << recent.confirmed << L" process (" << recent.automatic
+                       << L" tự động); RAM process trước khi dọn khoảng " << megabytes(recent.observed_working_set) << L" MB"
+                       << (recent.unknown_working_sets ? L" + " + std::to_wstring(recent.unknown_working_sets) + L" process chưa đo được RAM" : L"")
+                       << L" (không phải RAM hệ thống giảm thực tế)"
+                       << (cleanup_history_valid_ ? L"." : L"; lịch sử có thể thiếu.");
+        text << L"\r\nHIỆN TẠI: " << result.evidence.protected_live << L" process Codex đang dùng được giữ an toàn; "
+             << suspicious << L" process nghi ngờ đang chờ xác nhận."
+             << L"\r\nBẢO VỆ: Tự động không dọn process có Codex owner còn sống; dọn thủ công cần bạn xác nhận."
+             << L"\r\nCHI PHÍ APP: " << (result.guard_working_set_known ? megabytes(result.guard_working_set) + L" MB RAM" : L"không đo được RAM")
+             << L"; mỗi lần quét " << result.elapsed_ms << L" ms; quét " << settings_.interval_minutes << L" phút/lần."
+             << L"\r\nTỔNG GHI NHẬN" << (evidence_history_new_ || !evidence_history_valid_ ? L" (từ lần mở này)" : L"")
+             << L": Đã dọn " << saturating_add(totals_.auto_confirmed, totals_.manual_confirmed)
+             << L" process; RAM process trước khi dọn khoảng " << megabytes(totals_.estimated_released) << L" MB"
+             << (totals_.unknown_released ? L" + " + std::to_wstring(totals_.unknown_released) + L" process chưa đo được RAM" : L"")
+             << L" (không phải RAM hệ thống giảm thực tế).";
         SetWindowTextW(evidence_, text.str().c_str());
     }
 
@@ -699,6 +766,8 @@ private:
             if (!terminate_exact(identity)) continue;
             ++killed;
             const auto& process = snapshot.at(identity.pid);
+            if (!record_cleanup(process.working_set, process.working_set_known, false))
+                append_log(L"Recent cleanup history save failed; the 1-hour summary may be incomplete after restart.");
             if (process.working_set_known) estimated_released = saturating_add(estimated_released, process.working_set);
             else ++unknown_working_sets;
             append_log(L"MANUAL_CONFIRMED helper PID=" + std::to_wstring(identity.pid) + L", created=" +

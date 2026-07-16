@@ -228,6 +228,19 @@ EvidenceSnapshot build_evidence(const std::vector<TrackedProcess>& tracked, cons
     return result;
 }
 
+CleanupSummary summarize_cleanup(const std::vector<CleanupRecord>& records, std::uint64_t now,
+                                 std::uint64_t window_seconds) {
+    CleanupSummary result;
+    for (const auto& record : records) {
+        if (!record.timestamp || record.timestamp > now || now - record.timestamp > window_seconds) continue;
+        ++result.confirmed;
+        if (record.automatic) ++result.automatic;
+        if (record.working_set_known) result.observed_working_set = saturating_add(result.observed_working_set, record.working_set);
+        else ++result.unknown_working_sets;
+    }
+    return result;
+}
+
 std::uint64_t saturating_add(std::uint64_t left, std::uint64_t right) {
     return right > std::numeric_limits<std::uint64_t>::max() - left ? std::numeric_limits<std::uint64_t>::max() : left + right;
 }

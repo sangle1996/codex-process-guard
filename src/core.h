@@ -86,6 +86,20 @@ struct EvidenceSnapshot {
     std::uint64_t out_of_scope_working_set{};
 };
 
+struct CleanupRecord {
+    std::uint64_t timestamp{};
+    std::uint64_t working_set{};
+    bool working_set_known{};
+    bool automatic{};
+};
+
+struct CleanupSummary {
+    int confirmed{};
+    int automatic{};
+    int unknown_working_sets{};
+    std::uint64_t observed_working_set{};
+};
+
 std::optional<std::wstring> service_name(const Process& process);
 bool is_managed_helper(const Process& process);
 std::optional<Identity> find_codex_owner(const Process& process, const Snapshot& snapshot);
@@ -101,6 +115,8 @@ TerminationSummary terminate_candidates(std::vector<TrackedProcess>& tracked, co
                                         const std::function<bool(Identity)>& terminate);
 EvidenceSnapshot build_evidence(const std::vector<TrackedProcess>& tracked, const Snapshot& snapshot,
                                 const IdentitySet& live_codex);
+CleanupSummary summarize_cleanup(const std::vector<CleanupRecord>& records, std::uint64_t now,
+                                 std::uint64_t window_seconds);
 std::uint64_t saturating_add(std::uint64_t left, std::uint64_t right);
 
 } // namespace guard

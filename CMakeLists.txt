@@ -18,7 +18,7 @@ target_compile_options(guard_tests PRIVATE /W4 /WX /permissive-)
 add_executable(CodexProcessGuardNative WIN32 src/app.cpp)
 target_link_libraries(CodexProcessGuardNative PRIVATE guard_core comctl32 advapi32)
 target_compile_definitions(CodexProcessGuardNative PRIVATE UNICODE _UNICODE)
-target_compile_options(CodexProcessGuardNative PRIVATE /W4 /WX /permissive- $<$<NOT:$<CONFIG:Debug>>:/O2>)
+target_compile_options(CodexProcessGuardNative PRIVATE /W4 /WX /permissive- /utf-8 $<$<NOT:$<CONFIG:Debug>>:/O2>)
 
 enable_testing()
 add_test(NAME guard_tests COMMAND guard_tests)

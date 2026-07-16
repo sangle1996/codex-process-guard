@@ -248,6 +248,22 @@ void evidence_snapshot_test() {
     CHECK(guard::saturating_add(UINT64_MAX, 1) == UINT64_MAX);
 }
 
+void recent_cleanup_test() {
+    constexpr std::uint64_t now = 10'000;
+    const std::vector<guard::CleanupRecord> records{
+        {now - 3'599, 40 * 1024 * 1024, true, true},
+        {now - 60, 0, false, false},
+        {now - 3'600, 1 * 1024 * 1024, true, false},
+        {now - 3'601, 80 * 1024 * 1024, true, true},
+        {now + 1, 20 * 1024 * 1024, true, true}
+    };
+    const auto recent = guard::summarize_cleanup(records, now, 3'600);
+    CHECK(recent.confirmed == 3);
+    CHECK(recent.automatic == 1);
+    CHECK(recent.observed_working_set == 41 * 1024 * 1024);
+    CHECK(recent.unknown_working_sets == 1);
+}
+
 } // namespace
 
 int main() {
@@ -261,5 +277,6 @@ int main() {
     run("tracking never kills live owners and requires two orphan scans", tracking_state_machine_test);
     run("destructive coordinator fails closed and kills only exact candidates", destructive_coordinator_test);
     run("evidence reports only exact currently observed helpers", evidence_snapshot_test);
+    run("recent cleanup includes only confirmed exits in the time window", recent_cleanup_test);
     return failures == 0 ? 0 : 1;
 }

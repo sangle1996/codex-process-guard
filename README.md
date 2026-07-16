@@ -13,7 +13,7 @@ A dependency-free C++20/Win32 rewrite of Codex Process Guard for Windows. Automa
 
 ## Evidence shown in the UI
 
-The Evidence panel separates current observations, verified exits, local history, and scope limits. It reports recognized helpers with exact identities, unavailable working-set reads, live-protected helpers, helpers waiting for a second observation, eligible helpers whose exit was not confirmed, other Codex descendants outside the classifier, system physical-memory context, Guard's own working set, and scan time. It never labels working set or a whole-system RAM delta as memory saved. Confirmed automatic and manual actions are written to the visible log with helper PID, creation time, owner PID, and observed pre-kill working set when available.
+The summary panel shows confirmed cleanup over the last 60 minutes, observed pre-kill process working set (not measured system RAM reduction), currently protected/suspicious helpers, and the Guard's own cost. Confirmed automatic and manual actions are written to the visible log with helper PID, creation time, owner PID, and observed pre-kill working set when available. The UI summary is bounded to 60 minutes; cleanup history is pruned and rewritten atomically whenever a confirmed cleanup is recorded. Malformed or unwritable history is disclosed in the UI.
 
 ## Build and test
 
@@ -37,4 +37,4 @@ Run the executable and leave it in the notification area. The default interval i
 
 Windows Smart App Control can block any locally built unsigned binary. Do not disable Smart App Control. For distribution, sign the executable with a trusted code-signing certificate.
 
-Runtime data is stored under `%LOCALAPPDATA%\CodexProcessGuardNative`: `guard.log`, `tracked.tsv`, `settings.ini`, and `evidence.ini`.
+Runtime data is stored under `%LOCALAPPDATA%\CodexProcessGuardNative`: `guard.log`, `tracked.tsv`, `settings.ini`, `evidence.ini`, and `cleanup.tsv`.
