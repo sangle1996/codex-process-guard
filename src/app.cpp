@@ -240,6 +240,7 @@ private:
         case WM_COMMAND:
             switch (LOWORD(wparam)) {
             case id_save: save_from_controls(); break;
+            case id_startup: if (HIWORD(wparam) == BN_CLICKED) save_from_controls(); break;
             case id_scan: scan(true); break;
             case id_kill: kill_selected(); break;
             case id_hide: hide_to_tray(); break;

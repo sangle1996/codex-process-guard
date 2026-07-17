@@ -33,7 +33,7 @@ This repository intentionally uses no package manager, GUI framework, test frame
 
 ## Use
 
-Run the executable and leave it in the notification area. The default interval is two minutes. Change the interval or startup option and select **Save** to apply it. Closing the window hides it to the tray; right-click the tray icon and select **Exit** to stop it completely. Startup with Windows is off by default so this trial build cannot silently compete with another installed guard.
+Run the executable and leave it in the notification area. The default interval is two minutes. **Start with Windows** saves all current settings immediately; at Windows sign-in, the guard starts hidden in the notification area when the tray icon is available. Select **Save** to apply an interval change without toggling startup. Closing the window hides it to the tray; right-click the tray icon and select **Exit** to stop it completely. Startup with Windows is off by default.
 
 Windows Smart App Control can block any locally built unsigned binary. Do not disable Smart App Control. For distribution, sign the executable with a trusted code-signing certificate.
 
